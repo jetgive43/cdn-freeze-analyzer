@@ -12,9 +12,9 @@ function isBasicAuthDisabled() {
 
 function getBasicAuthCredentials() {
   return {
-    user: process.env.BASIC_AUTH_USER || 'admin',
-    pass: process.env.BASIC_AUTH_PASSWORD || 'Slwgusjdgjf*1',
-    realm: process.env.BASIC_AUTH_REALM || 'CDN Monitor',
+    user: process.env.BASIC_AUTH_USER,
+    pass: process.env.BASIC_AUTH_PASSWORD,
+    realm: process.env.BASIC_AUTH_REALM,
   };
 }
 
@@ -77,4 +77,5 @@ module.exports = {
   createBasicAuthMiddleware,
   validateBasicAuthorization,
   isBasicAuthDisabled,
+  getBasicAuthCredentials,
 };

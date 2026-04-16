@@ -58,7 +58,7 @@ class MeasurementController {
       const defaultProxyPort = this.proxyService?.config?.PROXY_PORTS?.[0];
       const effectiveProxyPort = proxyPort ?? defaultProxyPort;
       const proxyPortNum = parseInt(effectiveProxyPort, 10);
-      const limitNum = Math.min(parseInt(limitPerTarget, 10), 100);
+      const limitNum = Math.min(Math.max(1, parseInt(limitPerTarget, 10)), 200);
       
       if (isNaN(proxyPortNum) || isNaN(limitNum)) {
         return res.status(400).json({ 

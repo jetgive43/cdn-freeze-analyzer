@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import axios from 'axios';
+import { getBackendWebSocketUrl } from '../config';
+import { useAuth } from '../context/AuthContext';
 
 const COLUMN_WIDTH_LIMITS = {
   target: { min: 160, max: 420 },
@@ -8,6 +10,7 @@ const COLUMN_WIDTH_LIMITS = {
 };
 
 const StatusTable = () => {
+  const { authHeader } = useAuth();
   const [statusData, setStatusData] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -167,7 +170,7 @@ const StatusTable = () => {
       const response = await axios.post(
         `/api/ip-info/batch`,
         { ipList },
-        { timeout: 10000 }
+        { timeout: 10000, headers: { ...authHeader() } }
       );
 
       if (response.data.success) {
@@ -186,7 +189,7 @@ const StatusTable = () => {
       console.error('❌ Error fetching IP info:', err);
       // Continue without IP info if there's an error
     }
-  }, []);
+  }, [authHeader]);
   const formatPortLabel = useCallback((port) => {
     if (!port) return '';
     const country = port.countryCode || port.countryShort || port.country;
@@ -197,7 +200,7 @@ const StatusTable = () => {
 
   const fetchPorts = useCallback(async () => {
     try {
-      const response = await fetch('/api/ports');
+      const response = await fetch('/api/ports', { headers: { ...authHeader() } });
       if (!response.ok) {
         throw new Error(`Failed to load ports (${response.status})`);
       }
@@ -217,7 +220,7 @@ const StatusTable = () => {
       setPorts([]);
       setProxyPort('');
     }
-  }, []);
+  }, [authHeader]);
 
   useEffect(() => {
     fetchPorts();
@@ -244,7 +247,7 @@ const StatusTable = () => {
     try {
       const params = {
         proxyPort,
-        limitPerTarget: columnCount,
+        limitPerTarget: columnCount * 2,
         optimized: 'true',
         signal: abortControllerRef.current.signal
       };
@@ -254,7 +257,8 @@ const StatusTable = () => {
         {
           params,
           timeout: 15000,
-          signal: abortControllerRef.current.signal
+          signal: abortControllerRef.current.signal,
+          headers: { ...authHeader() },
         }
       );
 
@@ -279,7 +283,7 @@ const StatusTable = () => {
             error: latestMeasurement?.error_message || null,
             message: latestMeasurement?.message || 'No data available',
             rowNumber: index + 1,
-            history: reversedHistory.slice(0, columnCount),
+            history: reversedHistory.slice(0, columnCount * 2),
             avgRtt: avgRtt,
             groupKey: targetData.groupKey || latestMeasurement?.groupKey || null,
             groupLabel: targetData.groupLabel || latestMeasurement?.groupLabel || null,
@@ -298,7 +302,7 @@ const StatusTable = () => {
           const companyResponse = await axios.post(
             `/api/ip-info/batch`,
             { ipList: targetList },
-            { timeout: 10000 }
+            { timeout: 10000, headers: { ...authHeader() } }
           );
 
           if (companyResponse.data.success) {
@@ -337,7 +341,7 @@ const StatusTable = () => {
       }
       abortControllerRef.current = null;
     }
-  }, [proxyPort, columnCount, fetchIPInfo]);
+  }, [proxyPort, columnCount, fetchIPInfo, authHeader]);
 
   // FIXED: Handle proxy port change - refetch data immediately
   const handleProxyPortChange = (newProxyPort) => {
@@ -424,8 +428,8 @@ const StatusTable = () => {
     });
   }, [statusData, resolveNodeGroupName]);
 
-  // Generate table rows - ENHANCED with IP info
-  const generateTableRows = () => {
+  // Generate table rows - ENHANCED with IP info (pane 0 = newer window, pane 1 = older window)
+  const generateTableRowsForPane = (paneIndex) => {
     const sortedData = [...statusData].sort((a, b) => {
       if (!sortColumn) return 0;
 
@@ -465,7 +469,7 @@ const StatusTable = () => {
       const rows = grouped[groupName] || [];
       const isExpanded = expandedGroups[groupName] !== false;
       rendered.push(
-        <tr key={`group-${groupName}`} className="status-group-row">
+        <tr key={`group-${groupName}-p${paneIndex}`} className="status-group-row">
           <td colSpan={columnCount + 4} className="status-group-cell">
             <button
               type="button"
@@ -487,10 +491,12 @@ const StatusTable = () => {
       rows.forEach((row, rowIndex) => {
       displayRowNumber += 1;
       const history = row.history || [];
+      const start = paneIndex * columnCount;
       const displayHistory = [];
       for (let i = 0; i < columnCount; i++) {
-        if (i < history.length) {
-          displayHistory.push(history[i]);
+        const idx = start + i;
+        if (idx < history.length) {
+          displayHistory.push(history[idx]);
         } else {
           displayHistory.push(null);
         }
@@ -502,7 +508,7 @@ const StatusTable = () => {
       const targetMetaText = String(ipInfo?.country || '').trim() || 'Unknown';
 
       rendered.push(
-        <tr key={`${row.target}-${proxyPort}-${rowIndex}`} className="data-row">
+        <tr key={`${row.target}-${proxyPort}-${rowIndex}-p${paneIndex}`} className="data-row">
           <td className="row-number fixed-column" style={getStickyStyle('number')}>
             {displayRowNumber}
           </td>
@@ -624,12 +630,13 @@ const StatusTable = () => {
       setMeasurementStatus('manual_requested');
       setLoading(true);
 
-      await axios.post('/api/measurements/refresh-ips', {}, { timeout: 10000 });
+      await axios.post('/api/measurements/refresh-ips', {}, { timeout: 10000, headers: { ...authHeader() } });
 
       await fetchTimelineData(true);
 
         const response = await axios.post(`/api/measurements/send-packet`, {}, {
         timeout: 5000,
+        headers: { ...authHeader() },
       });
 
       console.log('✅ Packet send initiated:', response.data);
@@ -657,11 +664,7 @@ const StatusTable = () => {
         }
 
         // ✅ assign directly, don’t redeclare
-        ws.current = new WebSocket(
-          (window.location.protocol === 'https:' ? 'wss://' : 'ws://') +
-          window.location.host +
-          '/ws'
-        );
+        ws.current = new WebSocket(getBackendWebSocketUrl());
 
         ws.current.onopen = () => {
           if (!isMounted) return;
@@ -820,27 +823,28 @@ const StatusTable = () => {
     const sum = validRtts.reduce((a, b) => a + b, 0);
     return (sum / validRtts.length).toFixed(2);
   };
-  // Generate headers - Use actual available data from all rows
-  const generateHeaders = () => {
+  // Generate headers for one timeline pane (newer vs older columns)
+  const generateHeadersForPane = (paneIndex) => {
     if (statusData.length === 0) {
       return Array(columnCount).fill(0).map((_, index) => (
-        <th key={`empty-header-${index}`} className="time-header">
+        <th key={`empty-header-p${paneIndex}-${index}`} className="time-header">
           ...
         </th>
       ));
     }
 
-    // Collect ALL unique timestamps from ALL rows
     const allTimestamps = new Set();
-    statusData.forEach(row => {
-      (row.history || []).forEach(item => {
+    const start = paneIndex * columnCount;
+    const end = start + columnCount;
+    statusData.forEach((row) => {
+      const slice = (row.history || []).slice(start, end);
+      slice.forEach((item) => {
         if (item && (item.timestamp || item.created_at)) {
           allTimestamps.add(item.timestamp || item.created_at);
         }
       });
     });
 
-    // Sort timestamps and take the most recent ones
     const sortedTimestamps = Array.from(allTimestamps).sort((a, b) =>
       new Date(b) - new Date(a)
     ).slice(0, columnCount);
@@ -860,7 +864,7 @@ const StatusTable = () => {
 
       return (
         <th
-          key={isEmpty ? `empty-${index}` : `header-${timestamp}-${index}`}
+          key={isEmpty ? `empty-p${paneIndex}-${index}` : `header-p${paneIndex}-${timestamp}-${index}`}
           className="time-header"
           title={isEmpty ? 'Waiting for data' : formatTimestampWithDate(timestamp)}
         >
@@ -899,6 +903,85 @@ const StatusTable = () => {
     }
   };
 
+  const renderTimelineTable = (paneIndex, title) => {
+    const attachRefs = paneIndex === 0;
+    return (
+      <section className="status-table-pane" aria-label={title}>
+        <h3 className="status-table-pane-title">{title}</h3>
+        <div className="table-scroll-container">
+          <table className="rtt-table">
+            <thead>
+              <tr>
+                <th
+                  ref={attachRefs ? numberHeaderRef : undefined}
+                  className="fixed-column number-col sticky-header"
+                  style={{ ...getStickyStyle('number'), zIndex: 1000 }}
+                >
+                  No
+                </th>
+                <th
+                  ref={attachRefs ? targetHeaderRef : undefined}
+                  className="fixed-column target-col sticky-header"
+                  style={{
+                    ...getStickyStyle('target'),
+                    zIndex: 1000,
+                    width: `${columnWidths.target}px`,
+                    minWidth: `${columnWidths.target}px`,
+                    maxWidth: `${columnWidths.target}px`
+                  }}
+                >
+                  Target IP
+                </th>
+                <th
+                  ref={attachRefs ? companyHeaderRef : undefined}
+                  className="fixed-column company-col sticky-header"
+                  style={{
+                    ...getStickyStyle('company'),
+                    zIndex: 1000,
+                    width: `${columnWidths.company}px`,
+                    minWidth: `${columnWidths.company}px`,
+                    maxWidth: `${columnWidths.company}px`
+                  }}
+                  onClick={() => handleSort('company')}
+                >
+                  Company {sortColumn === 'company' && (sortDirection === 'asc' ? '▲' : '▼')}
+                </th>
+                <th
+                  ref={attachRefs ? avgHeaderRef : undefined}
+                  className="fixed-column avg-col sticky-header"
+                  style={{
+                    ...getStickyStyle('avg'),
+                    zIndex: 1000,
+                    width: `${columnWidths.avg}px`,
+                    minWidth: `${columnWidths.avg}px`,
+                    maxWidth: `${columnWidths.avg}px`
+                  }}
+                  onClick={() => handleSort('avgRtt')}
+                >
+                  RTT Avg {sortColumn === 'avgRtt' && (sortDirection === 'asc' ? '▲' : '▼')}
+                </th>
+                {generateHeadersForPane(paneIndex)}
+              </tr>
+            </thead>
+            <tbody>
+              {statusData.length > 0 ? (
+                generateTableRowsForPane(paneIndex)
+              ) : (
+                <tr>
+                  <td colSpan={columnCount + 4} className="no-data">
+                    {loading
+                      ? `Loading ${columnCount * 2} columns for proxy ${proxyPort}...`
+                      : 'No measurement data available'}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    );
+  };
+
   return (
     <div className="status-table-container">
       <div className="table-header">
@@ -925,7 +1008,7 @@ const StatusTable = () => {
               </select>
             </div>
             <div className="control-item">
-              <label htmlFor="columnCount">Columns: </label>
+              <label htmlFor="columnCount">Columns per table: </label>
               <select
                 id="columnCount"
                 value={columnCount}
@@ -1011,76 +1094,14 @@ const StatusTable = () => {
         </div>
       )}
 
-      <div className="table-scroll-container">
-        <table className="rtt-table">
-          <thead>
-            <tr>
-              <th
-                ref={numberHeaderRef}
-                className="fixed-column number-col sticky-header"
-                style={{ ...getStickyStyle('number'), zIndex: 1000 }}
-              >
-                No
-              </th>
-              <th
-                ref={targetHeaderRef}
-                className="fixed-column target-col sticky-header"
-                style={{
-                  ...getStickyStyle('target'),
-                  zIndex: 1000,
-                  width: `${columnWidths.target}px`,
-                  minWidth: `${columnWidths.target}px`,
-                  maxWidth: `${columnWidths.target}px`
-                }}
-              >
-                Target IP
-              </th>
-              <th
-                ref={companyHeaderRef}
-                className="fixed-column company-col sticky-header"
-                style={{
-                  ...getStickyStyle('company'),
-                  zIndex: 1000,
-                  width: `${columnWidths.company}px`,
-                  minWidth: `${columnWidths.company}px`,
-                  maxWidth: `${columnWidths.company}px`
-                }}
-                onClick={() => handleSort('company')}
-              >
-                Company {sortColumn === 'company' && (sortDirection === 'asc' ? '▲' : '▼')}
-              </th>
-              <th
-                ref={avgHeaderRef}
-                className="fixed-column avg-col sticky-header"
-                style={{
-                  ...getStickyStyle('avg'),
-                  zIndex: 1000,
-                  width: `${columnWidths.avg}px`,
-                  minWidth: `${columnWidths.avg}px`,
-                  maxWidth: `${columnWidths.avg}px`
-                }}
-                onClick={() => handleSort('avgRtt')}
-              >
-                RTT Avg {sortColumn === 'avgRtt' && (sortDirection === 'asc' ? '▲' : '▼')}
-              </th>
-              {generateHeaders()}
-            </tr>
-          </thead>
-          <tbody>
-            {statusData.length > 0 ? generateTableRows() : (
-              <tr>
-                <td colSpan={columnCount + 3} className="no-data">
-                  {loading ? `Loading ${columnCount} columns for proxy ${proxyPort}...` : 'No measurement data available'}
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+      <div className="status-table-pair">
+        {renderTimelineTable(0, 'Newest readings')}
+        {renderTimelineTable(1, 'Older readings')}
       </div>
 
       <div className="table-footer">
         <p>
-          Displaying: {statusData.length} targets × {columnCount} time points (Proxy: {proxyPort})
+          Displaying: {statusData.length} targets × {columnCount} columns × 2 tables (Proxy: {proxyPort})
           {lastUpdate && ` • Last update: ${formatTimestampWithDate(lastUpdate)}`}
         </p>
       </div>

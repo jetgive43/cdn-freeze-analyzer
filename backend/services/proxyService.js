@@ -1,4 +1,6 @@
 const tunnel = require('tunnel');
+const net = require('net');
+const { SocksClient } = require('socks');
 const { performance } = require('perf_hooks');
 const http = require('http');
 const { default: axios } = require('axios');
@@ -400,6 +402,121 @@ class ProxyService {
         });
       }
     })();
+  }
+
+  /**
+   * TCP connect to target through SOCKS5 proxy (same host/port/credentials as HTTP proxy for providers like SOAX).
+   * RTT = time until TCP tunnel to destination is established.
+   */
+  async measureTcpViaSocks5(targetHost, targetPort, proxyHost, proxyPort, user, pass, timeoutMs) {
+    const socksHost = (process.env.SOCKS5_PROXY_HOST || '').trim() || proxyHost;
+    const socksPort = (() => {
+      const envP = process.env.SOCKS5_PROXY_PORT;
+      if (envP != null && String(envP).trim() !== '') {
+        const n = Number(envP);
+        if (Number.isFinite(n) && n > 0) {
+          return n;
+        }
+      }
+      return proxyPort;
+    })();
+
+    const proxy = {
+      host: socksHost,
+      port: socksPort,
+      type: 5,
+    };
+    if (user && pass) {
+      proxy.userId = user;
+      proxy.password = pass;
+    }
+
+    const startTime = performance.now();
+    try {
+      const info = await SocksClient.createConnection({
+        command: 'connect',
+        proxy,
+        destination: { host: targetHost, port: targetPort },
+        timeout: timeoutMs,
+      });
+      const elapsed = performance.now() - startTime;
+      try {
+        info.socket.destroy();
+      } catch (_) {
+        /* ignore */
+      }
+      return {
+        status: 'success',
+        rtt_ms: Number(elapsed.toFixed(2)),
+        error_message: null,
+      };
+    } catch (err) {
+      const elapsed = performance.now() - startTime;
+      const msg = err?.message || String(err);
+      const lower = msg.toLowerCase();
+      let status = 'failed';
+      if (lower.includes('timeout') || lower.includes('etimedout')) {
+        status = 'timeout';
+      }
+      return {
+        status,
+        rtt_ms: Number(elapsed.toFixed(2)),
+        error_message: msg,
+      };
+    }
+  }
+
+  /**
+   * Plain TCP connect from this host to target (no SOCKS). RTT = time until connect succeeds.
+   */
+  measureTcpDirect(targetHost, targetPort, timeoutMs) {
+    const startTime = performance.now();
+    return new Promise((resolve) => {
+      const socket = net.createConnection(
+        { host: targetHost, port: targetPort, family: 0 },
+        () => {
+          const elapsed = performance.now() - startTime;
+          try {
+            socket.destroy();
+          } catch (_) {
+            /* ignore */
+          }
+          resolve({
+            status: 'success',
+            rtt_ms: Number(elapsed.toFixed(2)),
+            error_message: null,
+          });
+        }
+      );
+      socket.setTimeout(timeoutMs);
+      socket.once('timeout', () => {
+        const elapsed = performance.now() - startTime;
+        try {
+          socket.destroy();
+        } catch (_) {
+          /* ignore */
+        }
+        resolve({
+          status: 'timeout',
+          rtt_ms: Number(elapsed.toFixed(2)),
+          error_message: 'Connection timeout',
+        });
+      });
+      socket.once('error', (err) => {
+        const elapsed = performance.now() - startTime;
+        const msg = err?.message || String(err);
+        const lower = msg.toLowerCase();
+        let status = 'failed';
+        if (lower.includes('timeout') || lower.includes('etimedout')) {
+          status = 'timeout';
+        }
+        resolve({
+          status,
+          rtt_ms: Number(elapsed.toFixed(2)),
+          error_message: msg,
+        });
+      });
+    });
   }
 
   // FIXED: Run measurements for BOTH proxy ports simultaneously

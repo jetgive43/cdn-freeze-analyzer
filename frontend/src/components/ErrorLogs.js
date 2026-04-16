@@ -1,7 +1,10 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
+import { getBackendWebSocketUrl } from '../config';
+import { useAuth } from '../context/AuthContext';
 
 const ErrorLogs = () => {
+    const { authHeader } = useAuth();
     const [errors, setErrors] = useState([]);
     const [loading, setLoading] = useState(false);
     const [collecting, setCollecting] = useState(false);
@@ -25,7 +28,7 @@ const ErrorLogs = () => {
                 if (filters[key]) params.append(key, filters[key]);
             });
 
-            const response = await axios.get(`/api/errors?${params}`);
+            const response = await axios.get(`/api/errors?${params}`, { headers: { ...authHeader() } });
 
             if (response.data.success) {
                 setErrors(response.data.data);
@@ -40,7 +43,7 @@ const ErrorLogs = () => {
         } finally {
             setLoading(false);
         }
-    }, [filters]);
+    }, [filters, authHeader]);
 
     const handleCopyToClipboard = (text) => {
         // Try modern clipboard API first
@@ -149,25 +152,21 @@ const ErrorLogs = () => {
             document.body.removeChild(textArea);
         }
     };
-    const fetchLiveServers = async () => {
+    const fetchLiveServers = useCallback(async () => {
         try {
-            const response = await axios.get('/api/measurements/live-servers');
+            const response = await axios.get('/api/measurements/live-servers', { headers: { ...authHeader() } });
             if (response.data.success) {
                 setServers(response.data.servers);
             }
         } catch (error) {
             console.error('Error fetching live servers:', error);
         }
-    };
+    }, [authHeader]);
     useEffect(() => {
         fetchErrorLogs();
 
         // Set up WebSocket for real-time updates
-        const ws = new WebSocket(
-          (window.location.protocol === 'https:' ? 'wss://' : 'ws://') +
-          window.location.host +
-          '/ws'
-        );
+        const ws = new WebSocket(getBackendWebSocketUrl());
 
         ws.onopen = () => {
             console.log('🔌 WebSocket connected for error logs');
@@ -200,7 +199,7 @@ const ErrorLogs = () => {
 
     useEffect(() => {
         fetchLiveServers();
-    }, []);
+    }, [fetchLiveServers]);
     const handleFilterChange = (key, value) => {
         setFilters(prev => ({ ...prev, [key]: value }));    
     };
@@ -208,7 +207,7 @@ const ErrorLogs = () => {
     const handleCollectLogs = async () => {
         setCollecting(true);
         try {
-            const response = await axios.post('/api/errors/collect');
+            const response = await axios.post('/api/errors/collect', {}, { headers: { ...authHeader() } });
             if (response.data.success) {
                 alert(`Error log collection completed! ${response.data.totalLogs} new logs saved.`);
                 fetchErrorLogs(); // Refresh the list

@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useAuth } from '../context/AuthContext';
 
 const GroupManagementPanel = () => {
+  const { authHeader } = useAuth();
   const [loading, setLoading] = useState(false);
   const [savingRegions, setSavingRegions] = useState(false);
   const [savingPorts, setSavingPorts] = useState(false);
@@ -18,7 +20,7 @@ const GroupManagementPanel = () => {
     setLoading(true);
     setError('');
     try {
-      const response = await fetch('/api/group-mappings');
+      const response = await fetch('/api/group-mappings', { headers: { ...authHeader() } });
       const data = await response.json();
       if (!response.ok || !data.success) {
         throw new Error(data.error || `Failed (${response.status})`);
@@ -52,7 +54,7 @@ const GroupManagementPanel = () => {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [authHeader]);
 
   useEffect(() => {
     loadConfig();
@@ -72,7 +74,7 @@ const GroupManagementPanel = () => {
         .map(([regionName, groupKey]) => ({ regionName, groupKey }));
       const response = await fetch('/api/group-mappings/regions', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeader() },
         body: JSON.stringify({ mappings }),
       });
       const data = await response.json();
@@ -99,7 +101,7 @@ const GroupManagementPanel = () => {
         );
       const response = await fetch('/api/group-mappings/port-links', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeader() },
         body: JSON.stringify({ links }),
       });
       const data = await response.json();
@@ -142,7 +144,7 @@ const GroupManagementPanel = () => {
     try {
       const response = await fetch('/api/group-mappings/groups', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeader() },
         body: JSON.stringify({ groupKey, label }),
       });
       const data = await response.json();

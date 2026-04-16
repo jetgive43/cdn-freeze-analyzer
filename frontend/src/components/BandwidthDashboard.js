@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import BandwidthChart from './BandwidthChart';
+import { useAuth } from '../context/AuthContext';
 
 const BandwidthDashboard = () => {
+  const { authHeader } = useAuth();
   const [charts, setCharts] = useState([]);
   const [loading, setLoading] = useState(false);
   const [proxyPort, setProxyPort] = useState('');
@@ -46,7 +48,7 @@ const BandwidthDashboard = () => {
 
   const fetchPorts = useCallback(async () => {
     try {
-      const response = await fetch('/api/ports');
+      const response = await fetch('/api/ports', { headers: { ...authHeader() } });
       if (!response.ok) {
         throw new Error(`Failed to load ports (${response.status})`);
       }
@@ -66,7 +68,7 @@ const BandwidthDashboard = () => {
       setPorts([]);
       setProxyPort('');
     }
-  }, []);
+  }, [authHeader]);
 
   useEffect(() => {
     fetchPorts();
@@ -94,7 +96,7 @@ const BandwidthDashboard = () => {
       if (endISO) params.append('end', endISO);
       if (proxyPort) params.append('proxyPort', proxyPort);
 
-      const response = await fetch(`/api/bandwidth/ips?${params}`);
+      const response = await fetch(`/api/bandwidth/ips?${params}`, { headers: { ...authHeader() } });
 
       if (!response.ok) {
         throw new Error(`Failed to fetch IP list (status ${response.status})`);
@@ -154,7 +156,8 @@ const BandwidthDashboard = () => {
 
           try {
             const dataResponse = await fetch(`/api/bandwidth/data/${encodeURIComponent(ip)}?${dataParams}`, {
-              cache: 'no-store'
+              cache: 'no-store',
+              headers: { ...authHeader() },
             });
 
             if (!dataResponse.ok) {
@@ -209,7 +212,7 @@ const BandwidthDashboard = () => {
       setLoading(false);
       initialLoadRef.current = false;
     }
-  }, [loading, dateRange, proxyPort]);
+  }, [loading, dateRange, proxyPort, authHeader]);
 
   // Load initial charts
   useEffect(() => {

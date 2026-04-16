@@ -94,8 +94,8 @@ class DatabaseService {
     try {
       const query = `
         INSERT INTO measurements 
-        (target_host, target_port, proxy_host, proxy_port, status, rtt_ms, error_message, message, measurement_type, created_at) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())
+        (target_host, target_port, proxy_host, proxy_port, status, rtt_ms, error_message, message, measurement_type, check_type, viewer_country_code, viewer_country_name, viewer_isp, created_at) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())
       `;
 
       const [result] = await this.db.execute(query, [
@@ -107,7 +107,11 @@ class DatabaseService {
         measurement.rtt_ms,
         measurement.error_message,
         measurement.message,
-        measurement.measurement_type || 'http'
+        measurement.measurement_type || 'http',
+        measurement.check_type ?? null,
+        measurement.viewer_country_code ?? null,
+        measurement.viewer_country_name ?? null,
+        measurement.viewer_isp ?? null,
       ]);
 
       return result.insertId;
@@ -115,6 +119,64 @@ class DatabaseService {
       console.error('❌ Failed to save measurement to DB:', error.message);
       return null;
     }
+  }
+
+  /**
+   * Insert a measurement row with an explicit created_at (UTC 'YYYY-MM-DD HH:MM:SS').
+   * @param {object} measurement same shape as saveMeasurement
+   * @param {string} createdAtMysql
+   * @param {import('mysql2/promise').PoolConnection} [conn]
+   * @returns {Promise<number|null>} insertId
+   */
+  async insertMeasurementWithCreatedAt(measurement, createdAtMysql, conn = null) {
+    try {
+      const query = `
+        INSERT INTO measurements 
+        (target_host, target_port, proxy_host, proxy_port, status, rtt_ms, error_message, message, measurement_type, check_type, viewer_country_code, viewer_country_name, viewer_isp, created_at) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `;
+      const executor = conn || this.db;
+      const [result] = await executor.execute(query, [
+        measurement.target_host,
+        measurement.target_port,
+        measurement.proxy_host,
+        measurement.proxy_port,
+        measurement.status,
+        measurement.rtt_ms,
+        measurement.error_message,
+        measurement.message,
+        measurement.measurement_type || 'http',
+        measurement.check_type ?? null,
+        measurement.viewer_country_code ?? null,
+        measurement.viewer_country_name ?? null,
+        measurement.viewer_isp ?? null,
+        createdAtMysql,
+      ]);
+      return result.insertId;
+    } catch (error) {
+      if (conn) {
+        throw error;
+      }
+      console.error('❌ Failed to insert measurement with created_at:', error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Update a server_ping row by primary key.
+   * @param {number} id
+   * @param {{ status: string, rtt_ms: number|null, error_message: string|null, message: string }} fields
+   * @param {import('mysql2/promise').PoolConnection} [conn]
+   */
+  async updateServerPingMeasurementById(id, fields, conn = null) {
+    const executor = conn || this.db;
+    const [result] = await executor.execute(
+      `UPDATE measurements 
+       SET status = ?, rtt_ms = ?, error_message = ?, message = ? 
+       WHERE id = ? AND measurement_type = 'server_ping'`,
+      [fields.status, fields.rtt_ms, fields.error_message, fields.message, id]
+    );
+    return result.affectedRows > 0;
   }
 
   // FIXED: Get latest measurements with proper parameter binding
@@ -1493,15 +1555,6 @@ class DatabaseService {
   }
 
   /**
-   * Clean up old server_metrics data - keeps only the last 7 days
-   * @param {number} retentionDays - Number of days to keep (default: 7)
-   * @returns {Promise<{deletedCount: number, success: boolean}>}
-   */
-  async cleanupOldServerMetrics(retentionDays = 7) {
-    return this.cleanupOldData('server_metrics', 'created_at', retentionDays, 'CleanupOldServerMetrics');
-  }
-
-  /**
    * Cleanup all time-series/log tables older than N days.
    * Note: configuration/master tables are intentionally excluded.
    * @param {number} retentionDays
@@ -1510,9 +1563,9 @@ class DatabaseService {
   async cleanupAllDataOlderThan(retentionDays = 7) {
     const tasks = [
       { table: 'measurements', dateColumn: 'created_at', label: 'CleanupAll.measurements' },
-      { table: 'server_metrics', dateColumn: 'created_at', label: 'CleanupAll.server_metrics' },
       { table: 'error_logs', dateColumn: 'created_at', label: 'CleanupAll.error_logs' },
       { table: 'bandwidth_measurements', dateColumn: 'timestamp', label: 'CleanupAll.bandwidth_measurements' },
+      { table: 'server_mtr_runs', dateColumn: 'created_at', label: 'CleanupAll.server_mtr_runs' },
     ];
 
     const results = [];
@@ -1540,17 +1593,110 @@ class DatabaseService {
   }
 
   /**
-   * Recent server-ping RTT rows from measurements (measurement_type = server_ping).
-   * @returns {Record<string, Array<{status, rtt_ms, error_message, created_at, timestamp}>>}
+   * Viewer regions as a country → ISP tree (from stored viewer_country_* / viewer_isp on server_ping rows).
+   * @returns {Promise<Array<{ code: string, name: string, count: number, isps: Array<{ isp: string|null, count: number, lastAt: string|null }> }>>}
    */
-  async getServerPingHistoryBatch(proxyPort, ipList, limitPerIp) {
+  async listServerPingViewerRegions() {
+    const [rows] = await this.db.execute(
+      `SELECT viewer_country_code AS code,
+          MAX(viewer_country_name) AS country_name,
+          viewer_isp AS isp,
+          COUNT(*) AS cnt,
+          MAX(created_at) AS last_at
+        FROM measurements
+        WHERE measurement_type = 'server_ping'
+          AND viewer_country_code IS NOT NULL
+          AND TRIM(viewer_country_code) != ''
+        GROUP BY viewer_country_code, viewer_isp
+        ORDER BY viewer_country_code ASC, cnt DESC`
+    );
+    const countryMap = new Map();
+    for (const row of rows || []) {
+      const raw = String(row.code || '').trim();
+      const code = /^[A-Za-z]{2}$/.test(raw) ? raw.toUpperCase() : raw;
+      if (code.length !== 2) {
+        continue;
+      }
+      const ispTrim = row.isp != null ? String(row.isp).trim() : '';
+      const ispNorm = ispTrim !== '' ? ispTrim : null;
+      const cnt = Number(row.cnt) || 0;
+      const lastAt = row.last_at || null;
+      if (!countryMap.has(code)) {
+        countryMap.set(code, {
+          code,
+          name: String(row.country_name || code || 'Unknown').trim() || code,
+          count: 0,
+          isps: [],
+        });
+      }
+      const node = countryMap.get(code);
+      node.count += cnt;
+      const dn = String(row.country_name || '').trim();
+      if (dn && dn !== code) {
+        node.name = dn;
+      }
+      node.isps.push({ isp: ispNorm, count: cnt, lastAt });
+    }
+    const out = [...countryMap.values()].sort((a, b) => {
+      const ta = Math.max(0, ...a.isps.map((i) => new Date(i.lastAt || 0).getTime()));
+      const tb = Math.max(0, ...b.isps.map((i) => new Date(i.lastAt || 0).getTime()));
+      return tb - ta;
+    });
+    const [legacyRows] = await this.db.execute(
+      `SELECT COUNT(*) AS c FROM measurements
+        WHERE measurement_type = 'server_ping'
+          AND (viewer_country_code IS NULL OR TRIM(viewer_country_code) = '')`
+    );
+    const legacyCount = Number(legacyRows?.[0]?.c) || 0;
+    if (legacyCount > 0) {
+      out.push({
+        code: '__legacy__',
+        name: 'Older data (no region)',
+        count: legacyCount,
+        isps: [],
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Recent server-ping RTT rows from measurements (measurement_type = server_ping), by viewer region.
+   * @param {string} regionCode ISO 3166-1 alpha-2, '__legacy__', or '__none__'
+   * @param {Array<{ ip: string, port: number }>} targets
+   * @param {string|undefined} viewerIspFilter undefined = all ISPs in country; '__unknown__' = empty ISP; else exact viewer_isp match
+   * @returns {Record<string, Array<{status, rtt_ms, error_message, created_at, timestamp}>>}
+   *   Keys are `${ip}:${port}`.
+   */
+  async getServerPingHistoryBatch(regionCode, targets, limitPerIp, viewerIspFilter) {
     const out = {};
-    if (!ipList || ipList.length === 0) {
+    if (!targets || targets.length === 0) {
       return out;
     }
-    const portNum = Number(proxyPort);
     const lim = Math.min(Math.max(1, Number(limitPerIp) || 12), 50);
-    const placeholders = ipList.map(() => '?').join(',');
+    const tuplePlaceholders = targets.map(() => '(?, ?)').join(', ');
+    const flatParams = targets.flatMap((t) => [t.ip, Number(t.port) || 80]);
+
+    let regionSql = '1=0';
+    const regionParams = [];
+    const rc = String(regionCode || '__none__').trim();
+    if (rc === '__legacy__') {
+      regionSql = '(viewer_country_code IS NULL OR TRIM(viewer_country_code) = \'\')';
+    } else if (rc !== '__none__' && rc.length === 2) {
+      regionSql = 'viewer_country_code = ?';
+      regionParams.push(rc.toUpperCase());
+    }
+
+    let ispSql = '1=1';
+    const ispParams = [];
+    if (rc.length === 2 && viewerIspFilter !== undefined && viewerIspFilter !== null) {
+      if (viewerIspFilter === '__unknown__') {
+        ispSql = '(viewer_isp IS NULL OR TRIM(viewer_isp) = \'\')';
+      } else {
+        ispSql = 'viewer_isp = ?';
+        ispParams.push(String(viewerIspFilter));
+      }
+    }
+
     const query = `
       WITH ranked AS (
         SELECT target_host, target_port, status, rtt_ms, error_message, created_at,
@@ -1558,31 +1704,118 @@ class DatabaseService {
             CONVERT_TZ(created_at, @@session.time_zone, '+00:00'),
             '%Y-%m-%dT%H:%i:%s.000Z'
           ) AS created_at_utc,
-          ROW_NUMBER() OVER (PARTITION BY target_host ORDER BY created_at DESC) AS rn
+          ROW_NUMBER() OVER (
+            PARTITION BY target_host, target_port
+            ORDER BY created_at DESC, id DESC
+          ) AS rn
         FROM measurements
-        WHERE proxy_port = ?
-          AND measurement_type = 'server_ping'
-          AND target_host IN (${placeholders})
+        WHERE measurement_type = 'server_ping'
+          AND ${regionSql}
+          AND ${ispSql}
+          AND (target_host, target_port) IN (${tuplePlaceholders})
       )
       SELECT target_host, target_port, status, rtt_ms, error_message, created_at, created_at_utc, rn
       FROM ranked
       WHERE rn <= ?
-      ORDER BY target_host, rn ASC
+      ORDER BY target_host, target_port, rn ASC
     `;
-    const [rows] = await this.db.execute(query, [portNum, ...ipList, lim]);
-    ipList.forEach((ip) => {
-      out[ip] = [];
-    });
+    const [rows] = await this.db.execute(query, [...regionParams, ...ispParams, ...flatParams, lim]);
+    for (const t of targets) {
+      const p = Number(t.port) || 80;
+      out[`${t.ip}:${p}`] = [];
+    }
     for (const row of rows) {
-      if (!out[row.target_host]) {
-        out[row.target_host] = [];
+      const key = `${row.target_host}:${row.target_port}`;
+      if (!out[key]) {
+        out[key] = [];
       }
-      out[row.target_host].push({
+      out[key].push({
         status: row.status,
         rtt_ms: row.rtt_ms,
         error_message: row.error_message,
         created_at: row.created_at_utc || row.created_at,
         timestamp: row.created_at_utc || row.created_at,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Recent MTR runs per target for a proxy port (metadata only; omit report_text in query).
+   * @param {number|string} proxyPort
+   * @param {number[]} targetIds server_ping_targets.id
+   * @param {number} limitPerTarget
+   * @returns {Record<number, Array>}
+   */
+  async getServerMtrHistoryBatch(proxyPort, targetIds, limitPerTarget) {
+    const out = {};
+    if (!targetIds || targetIds.length === 0) {
+      return out;
+    }
+    const portNum = Number(proxyPort);
+    if (!Number.isFinite(portNum)) {
+      return out;
+    }
+    const lim = Math.min(Math.max(1, Number(limitPerTarget) || 6), 20);
+    const placeholders = targetIds.map(() => '?').join(', ');
+    const query = `
+      WITH ranked AS (
+        SELECT id, server_ping_target_id, proxy_port, path_mode, status, error_message, summary_json, created_at,
+          DATE_FORMAT(
+            CONVERT_TZ(created_at, @@session.time_zone, '+00:00'),
+            '%Y-%m-%dT%H:%i:%s.000Z'
+          ) AS created_at_utc,
+          ROW_NUMBER() OVER (
+            PARTITION BY server_ping_target_id ORDER BY created_at DESC
+          ) AS rn
+        FROM server_mtr_runs
+        WHERE proxy_port = ?
+          AND server_ping_target_id IN (${placeholders})
+      )
+      SELECT id, server_ping_target_id, proxy_port, path_mode, status, error_message, summary_json, created_at, created_at_utc, rn
+      FROM ranked
+      WHERE rn <= ?
+      ORDER BY server_ping_target_id, rn ASC
+    `;
+    const [rows] = await this.db.execute(query, [portNum, ...targetIds, lim]);
+    for (const id of targetIds) {
+      out[id] = [];
+    }
+    for (const row of rows) {
+      const tid = row.server_ping_target_id;
+      if (!out[tid]) {
+        out[tid] = [];
+      }
+      let summary = row.summary_json;
+      if (typeof summary === 'string') {
+        try {
+          summary = JSON.parse(summary);
+        } catch {
+          summary = null;
+        }
+      }
+      const hubs = summary?.report?.hubs;
+      const hopCount = Array.isArray(hubs) ? hubs.length : null;
+      let targetRttMs = null;
+      if (hopCount > 0) {
+        const last = hubs[hopCount - 1];
+        const raw = last?.Avg ?? last?.avg ?? last?.Last ?? last?.last;
+        if (raw != null) {
+          const n = Number(raw);
+          if (Number.isFinite(n)) {
+            targetRttMs = n;
+          }
+        }
+      }
+      out[tid].push({
+        id: row.id,
+        status: row.status,
+        path_mode: row.path_mode,
+        error_message: row.error_message,
+        created_at: row.created_at_utc || row.created_at,
+        hop_count: hopCount,
+        target_rtt_ms: targetRttMs,
+        preview: hopCount != null ? `${hopCount} hops` : row.status === 'success' ? 'OK' : '—',
       });
     }
     return out;

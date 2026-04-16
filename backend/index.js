@@ -3,10 +3,9 @@ const cors = require('cors');
 const WebSocket = require('ws');
 const http = require('http');
 const path = require('path');
+const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
-const {
-  createBasicAuthMiddleware,
-} = require('./middleware/basicAuth');
+const { createUnifiedAuthMiddleware } = require('./middleware/unifiedAuth');
 const { createDbConnection, initializeDatabase } = require('./config/database');
 const DatabaseService = require('./services/databaseService');
 const ProxyService = require('./services/proxyService');
@@ -18,6 +17,9 @@ const BandwidthController = require('./controllers/bandwidthController');
 const SettingsService = require('./services/settingsService');
 const SettingsController = require('./controllers/settingsController');
 const settingsRoutes = require('./routes/settings');
+const AuthService = require('./services/authService');
+const AuthController = require('./controllers/authController');
+const authRoutes = require('./routes/auth');
 
 
 const app = express();
@@ -35,7 +37,7 @@ app.use(cors({
   optionsSuccessStatus: 200,
 }));
 app.use(express.json());
-app.use(createBasicAuthMiddleware());
+app.use(express.urlencoded({ extended: true }));
 
 // WebSocket connections storage
 const clients = new Set();
@@ -110,7 +112,9 @@ async function initializeIPDatabase() {
       return 0;
     }
 
-    const loadedCount = await IPInfoService.loadIPRangesFromCSV('./data/asn.csv');
+    const loadedCount = await IPInfoService.loadIPRangesFromCSV(
+      path.join(__dirname, 'data', 'asn.csv')
+    );
 
     const loadTime = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`✅ IP information service ready in ${loadTime}s with ${loadedCount} ranges`);
@@ -134,7 +138,6 @@ let measurementTimer = null;
 /** Set in initializeApp — used by schedulers to require active proxy_ports (status=1). */
 let portServiceForSchedulers = null;
 let groupMappingServiceForSync = null;
-let serverPingIntervalId = null;
 const NORMAL_MEASUREMENT_INTERVAL_MS = 15 * 60 * 1000;
 let currentMeasurementIntervalMs = NORMAL_MEASUREMENT_INTERVAL_MS;
 
@@ -443,6 +446,10 @@ const initializeApp = async () => {
     // Initialize services
     databaseService = new DatabaseService(db);
     proxyService = new ProxyService();
+    const authService = new AuthService(db);
+    app.use(createUnifiedAuthMiddleware(authService));
+    const authController = new AuthController(authService);
+    app.use('/api/auth', authRoutes(authController));
     const settingsService = new SettingsService(db);
 
     const bandwidthService = new BandwidthService(proxyService, databaseService);
@@ -454,14 +461,34 @@ const initializeApp = async () => {
       proxyService,
       db,
       databaseService,
-      geoIpService
+      geoIpService,
+      authService
     );
     if (!geoIpService.isDatabasePresent()) {
       console.log(
         'ℹ️  GeoLite2-Country.mmdb not found — country labels default to Unknown. Place the file at repo root or backend/data/, set MMDB_COUNTRY_PATH, or run backend/scripts/download-maxmind-country.sh with MAXMIND_LICENSE_KEY.'
       );
     }
-    const serverPingController = new ServerPingController(serverPingService);
+    if (!geoIpService.isAsnDatabasePresent()) {
+      console.log(
+        'ℹ️  GeoLite2-ASN.mmdb not found — viewer ISP/network names will be empty. Run backend/scripts/download-maxmind-asn.sh with MAXMIND_LICENSE_KEY, or place GeoLite2-ASN.mmdb at repo root or backend/data/, or set MMDB_ASN_PATH.'
+      );
+    }
+    const serverPingController = new ServerPingController(serverPingService, authService);
+    const ServerMtrService = require('./services/serverMtrService');
+    const ServerMtrController = require('./controllers/serverMtrController');
+    const serverMtrService = new ServerMtrService(
+      serverPingService,
+      db,
+      databaseService,
+      authService
+    );
+    const serverMtrController = new ServerMtrController(serverMtrService, authService);
+    const BusinessServerService = require('./services/businessServerService');
+    const BusinessServerController = require('./controllers/businessServerController');
+    const businessServerRoutes = require('./routes/businessServers');
+    const businessServerService = new BusinessServerService(db);
+    const businessServerController = new BusinessServerController(businessServerService);
     // Initialize Cache Service and start scheduler
     const CacheService = require('./services/cacheService');
     const cacheService = new CacheService(databaseService);
@@ -548,11 +575,8 @@ const initializeApp = async () => {
     const errorLogService = new ErrorLogService(proxyService);
     const errorLogController = new ErrorLogController(errorLogService);
 
-    // Initialize metrics controller
-    const MetricsController = require('./controllers/metricsController');
     const PortService = require('./services/portService');
     const PortController = require('./controllers/portController');
-    const metricsController = new MetricsController(db);
     const portService = new PortService(databaseService);
     const groupMappingService = new GroupMappingService(db);
     groupMappingServiceForSync = groupMappingService;
@@ -574,71 +598,18 @@ const initializeApp = async () => {
 
     // Update routes setup:
     app.use('/api/settings', settingsRoutes(settingsController));
+    app.use('/api/business-servers', businessServerRoutes(businessServerController));
     app.use('/api', apiRoutes(
       measurementController,
       systemController,
       historyController,
       bandwidthController,
       errorLogController,
-      metricsController,
       portController,
       serverPingController,
+      serverMtrController,
       groupMappingController
     ));
-
-    const SERVER_PING_INTERVAL_MS = 4 * 60 * 1000;
-    const runScheduledServerPing = async () => {
-      try {
-        const activePorts = portServiceForSchedulers
-          ? await portServiceForSchedulers.listActivePorts()
-          : [];
-        if (!activePorts.length) {
-          console.log('⏭️ Scheduled server ping skipped — no active proxy ports');
-          return;
-        }
-        const envPingPort = process.env.SERVER_PING_CRON_PROXY_PORT;
-        let proxyPortForCron;
-        if (envPingPort != null && String(envPingPort).trim() !== '') {
-          const wanted = String(envPingPort).trim();
-          const match = activePorts.find((p) => String(p.portNumber) === wanted);
-          if (!match) {
-            console.log(
-              `⏭️ Scheduled server ping skipped — SERVER_PING_CRON_PROXY_PORT=${wanted} is not among active proxy ports`
-            );
-            return;
-          }
-          proxyPortForCron = wanted;
-        } else {
-          proxyPortForCron = String(activePorts[0].portNumber);
-        }
-        const result = await serverPingService.pingAllServers(proxyPortForCron);
-        if (result.success) {
-          broadcastToClients({
-            type: 'server_ping_updated',
-            results: result.results,
-            timestamp: result.timestamp,
-            proxyPort: result.proxyPort,
-            source: 'scheduled',
-          });
-        } else if (result.error) {
-          console.warn('⚠️ Scheduled server ping:', result.error);
-        }
-      } catch (e) {
-        console.error('❌ Scheduled server ping error:', e.message);
-      }
-    };
-    setTimeout(() => {
-      runScheduledServerPing();
-    }, 20000);
-    serverPingIntervalId = setInterval(runScheduledServerPing, SERVER_PING_INTERVAL_MS);
-    const initialPingPort =
-      process.env.SERVER_PING_CRON_PROXY_PORT != null &&
-      process.env.SERVER_PING_CRON_PROXY_PORT !== ''
-        ? String(process.env.SERVER_PING_CRON_PROXY_PORT)
-        : String(ports[0]?.portNumber ?? '(first active when present)');
-    console.log(
-      `🏓 Server ping every ${SERVER_PING_INTERVAL_MS / 60000} min when active proxy ports exist (default proxy ${initialPingPort}; set SERVER_PING_CRON_PROXY_PORT to fix port), first run ~20s after boot`
-    );
 
     // Get companies from historical IPs in measurements table
     app.get('/api/companies/historical', async (req, res) => {
@@ -740,14 +711,38 @@ const initializeApp = async () => {
       }
     });
 
+    // React SPA: deep links like /admin/server-ping need index.html (same origin as /api when proxied to this server).
+    const frontendBuildPath = path.resolve(
+      process.env.FRONTEND_BUILD_PATH || path.join(__dirname, '../frontend/build')
+    );
+    const spaIndexHtml = path.join(frontendBuildPath, 'index.html');
+    if (fs.existsSync(spaIndexHtml)) {
+      app.use(express.static(frontendBuildPath));
+      app.use((req, res, next) => {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          return next();
+        }
+        if (req.path.startsWith('/api') || req.path.startsWith('/ws')) {
+          return next();
+        }
+        return res.sendFile(spaIndexHtml);
+      });
+      console.log(`📂 Serving React SPA from ${frontendBuildPath} (client-side routes)`);
+    } else {
+      console.log(
+        `ℹ️  No React build at ${frontendBuildPath} — run cd frontend && npm run build, or set FRONTEND_BUILD_PATH`
+      );
+    }
+
     // Initialize IP database and start server
     initializeIPDatabase().then((loadedCount) => {
       // Start cache scheduler AFTER IP ranges are loaded
       cacheService.startScheduler();
 
-      server.listen(PORT, () => {
-        console.log(`🚀 Server is running at port ${PORT}!`);
-        console.log(`🔌 WebSocket server running on ws://162.247.153.49:${PORT}/ws`);
+      const bindHost = process.env.BIND_HOST || '0.0.0.0';
+      server.listen(PORT, bindHost, () => {
+        console.log(`🚀 HTTP API listening on http://${bindHost}:${PORT} (use your server IP or DNS in the browser)`);
+        console.log(`🔌 WebSocket path /ws on port ${PORT}`);
         console.log(`⏰ Automatic TTL measurements: every ${formatIntervalMinutes(NORMAL_MEASUREMENT_INTERVAL_MS)} min when active proxy ports exist`);
         console.log(`📦 Manual packet endpoint: POST /api/measurements/send-packet`);
         console.log(`🔄 IP refresh endpoint: POST /api/measurements/refresh-ips`);
@@ -775,12 +770,6 @@ process.on('SIGINT', () => {
     clearInterval(cleanupInterval);
     cleanupInterval = null;
     console.log('🧹 Cleanup scheduler stopped');
-  }
-
-  if (serverPingIntervalId) {
-    clearInterval(serverPingIntervalId);
-    serverPingIntervalId = null;
-    console.log('🏓 Server ping scheduler stopped');
   }
 
   clients.forEach(client => {

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { format } from 'date-fns';
+import { useAuth } from '../context/AuthContext';
 import './PortsPanel.css';
 
 const INITIAL_FORM = {
@@ -21,6 +22,7 @@ const formatTs = (v) => {
 };
 
 const PortsPanel = () => {
+  const { authHeader } = useAuth();
   const [ports, setPorts] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -35,7 +37,7 @@ const PortsPanel = () => {
     try {
       setLoading(true);
       setError('');
-      const response = await fetch('/api/ports');
+      const response = await fetch('/api/ports', { headers: { ...authHeader() } });
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
         throw new Error(data.error || `Request failed (${response.status})`);
@@ -54,7 +56,7 @@ const PortsPanel = () => {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [authHeader]);
 
   useEffect(() => {
     fetchPorts();
@@ -134,7 +136,7 @@ const PortsPanel = () => {
       }
       const response = await fetch('/api/ports', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeader() },
         body: JSON.stringify({
           portNumber: Number(port.portNumber),
           country: (port.country || '').trim(),
@@ -168,7 +170,7 @@ const PortsPanel = () => {
     try {
       const response = await fetch(`/api/ports/${portNumber}`, {
         method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeader() },
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok || !data.success) {
@@ -201,7 +203,7 @@ const PortsPanel = () => {
     try {
       const response = await fetch('/api/ports', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeader() },
         body: JSON.stringify({
           portNumber,
           country: form.country.trim(),

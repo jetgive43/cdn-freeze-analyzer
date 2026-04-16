@@ -69,6 +69,7 @@ web_modules/
 .env
 .env.*
 !.env.example
+!frontend/.env.example
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache
@@ -134,11 +135,13 @@ dist
 !.yarn/sdks
 !.yarn/versions
 
-# MaxMind GeoLite (download with backend/scripts/download-maxmind-country.sh)
+# MaxMind GeoLite (backend/scripts/download-maxmind-country.sh, download-maxmind-asn.sh)
 backend/data/GeoLite2-Country.mmdb
+backend/data/GeoLite2-ASN.mmdb
 backend/data/GeoLite2-*.tar.gz
 
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 GeoLite2-Country.mmdb
+GeoLite2-ASN.mmdb

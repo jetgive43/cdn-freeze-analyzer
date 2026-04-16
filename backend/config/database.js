@@ -2,6 +2,119 @@ const mysql = require('mysql2/promise');
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
+/** HTTP-only targets: drop legacy check_type / SSH rows and enforce one row per (user, group, IP). */
+async function migrateServerPingTargetsHttpOnly(db) {
+  const [[ctCol]] = await db.execute(
+    `SELECT COUNT(*) AS c FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'server_ping_targets' AND column_name = 'check_type'`
+  );
+  if (Number(ctCol.c) > 0) {
+    try {
+      await db.execute("DELETE FROM server_ping_targets WHERE check_type = 'ssh'");
+    } catch (e) {
+      console.warn('⚠️ server_ping_targets delete ssh:', e.message);
+    }
+    for (const name of ['uniq_server_ping_user_group_ip_check', 'uniq_server_ping_group_ip_check']) {
+      try {
+        await db.execute(`ALTER TABLE server_ping_targets DROP INDEX ${name}`);
+      } catch (e) {
+        if (e.errno !== 1091) {
+          console.warn(`⚠️ drop index ${name}:`, e.message);
+        }
+      }
+    }
+    try {
+      await db.execute(`DELETE t1 FROM server_ping_targets t1
+        INNER JOIN server_ping_targets t2
+        ON t1.user_id <=> t2.user_id AND t1.group_name = t2.group_name AND t1.ip_address = t2.ip_address AND t1.id > t2.id`);
+    } catch (e) {
+      console.warn('⚠️ server_ping_targets dedupe:', e.message);
+    }
+    try {
+      await db.execute('ALTER TABLE server_ping_targets DROP COLUMN check_type');
+    } catch (e) {
+      console.warn('⚠️ drop server_ping_targets.check_type:', e.message);
+    }
+  }
+  try {
+    await db.execute(
+      'ALTER TABLE server_ping_targets ADD UNIQUE KEY uniq_server_ping_user_group_ip (user_id, group_name, ip_address)'
+    );
+  } catch (e) {
+    if (e.errno !== 1061) {
+      console.warn('⚠️ add uniq_server_ping_user_group_ip:', e.message);
+    }
+  }
+}
+
+/** Client IP + creator_key for public / non-admin server-ping targets (replaces per-user_id for normal users). */
+async function migrateServerPingTargetsCreatorKey(db) {
+  const addCol = async (sql, ctx) => {
+    try {
+      await db.execute(sql);
+    } catch (e) {
+      if (e.errno !== 1060) {
+        throw e;
+      }
+      console.log(`ℹ️  Schema change skipped for ${ctx}: already applied`);
+    }
+  };
+  await addCol(
+    'ALTER TABLE server_ping_targets ADD COLUMN client_ip VARCHAR(64) NULL AFTER user_id',
+    'server_ping_targets.client_ip'
+  );
+  await addCol(
+    'ALTER TABLE server_ping_targets ADD COLUMN creator_key VARCHAR(160) NULL AFTER client_ip',
+    'server_ping_targets.creator_key'
+  );
+  try {
+    await db.execute(
+      `UPDATE server_ping_targets SET creator_key = CONCAT('uid:', user_id) WHERE user_id IS NOT NULL AND (creator_key IS NULL OR creator_key = '')`
+    );
+    await db.execute(
+      `UPDATE server_ping_targets SET creator_key = CONCAT('legacy:', id) WHERE (creator_key IS NULL OR creator_key = '')`
+    );
+  } catch (e) {
+    console.warn('⚠️ server_ping_targets creator_key backfill:', e.message);
+  }
+  try {
+    await db.execute('ALTER TABLE server_ping_targets MODIFY creator_key VARCHAR(160) NOT NULL');
+  } catch (e) {
+    console.warn('⚠️ server_ping_targets creator_key NOT NULL:', e.message);
+  }
+  try {
+    await db.execute('ALTER TABLE server_ping_targets DROP INDEX uniq_server_ping_user_group_ip');
+  } catch (e) {
+    if (e.errno !== 1091) {
+      console.warn('⚠️ drop uniq_server_ping_user_group_ip:', e.message);
+    }
+  }
+  try {
+    await db.execute(
+      'ALTER TABLE server_ping_targets ADD UNIQUE KEY uniq_spt_creator_group_ip (creator_key, group_name, ip_address)'
+    );
+  } catch (e) {
+    if (e.errno !== 1061) {
+      console.warn('⚠️ add uniq_spt_creator_group_ip:', e.message);
+    }
+  }
+}
+
+async function migrateServerMtrRunsDropCheckType(db) {
+  const [[ctCol]] = await db.execute(
+    `SELECT COUNT(*) AS c FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'server_mtr_runs' AND column_name = 'check_type'`
+  );
+  if (Number(ctCol.c) === 0) {
+    return;
+  }
+  try {
+    await db.execute('ALTER TABLE server_mtr_runs DROP COLUMN check_type');
+  } catch (e) {
+    console.warn('⚠️ drop server_mtr_runs.check_type:', e.message);
+  }
+}
+
 const createDbConnection = () => {
   const pool = mysql.createPool({
     host: process.env.DB_HOST || 'localhost',
@@ -51,6 +164,7 @@ const initializeDatabase = async (db) => {
           error_message TEXT,
           message TEXT,
           measurement_type VARCHAR(32) NULL DEFAULT 'http',
+          check_type VARCHAR(16) NULL,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           INDEX idx_target (target_host, target_port),
           INDEX idx_proxy (proxy_host, proxy_port),
@@ -143,6 +257,23 @@ const initializeDatabase = async (db) => {
       }
     };
 
+    const dropColumnIfExists = async (tableName, columnName, context) => {
+      try {
+        const [[col]] = await db.execute(
+          `SELECT COUNT(*) AS c FROM information_schema.columns
+           WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
+          [tableName, columnName]
+        );
+        if (Number(col.c) === 0) {
+          return;
+        }
+        await db.execute(`ALTER TABLE \`${tableName}\` DROP COLUMN \`${columnName}\``);
+        console.log(`✅ Dropped ${context}`);
+      } catch (error) {
+        console.warn(`⚠️ Drop column skipped for ${context}:`, error.message);
+      }
+    };
+
     await addColumnIfMissing(
       'ALTER TABLE bandwidth_measurements ADD COLUMN proxy_port INT NOT NULL DEFAULT 0 AFTER ip_address',
       'bandwidth_measurements.proxy_port'
@@ -165,25 +296,51 @@ const initializeDatabase = async (db) => {
       'measurements.measurement_type'
     );
 
-    await db.execute(`
-        CREATE TABLE IF NOT EXISTS server_metrics (
-          id INT AUTO_INCREMENT PRIMARY KEY,
-          server VARCHAR(255) NOT NULL,
-          timestamp DATETIME NOT NULL,
-          cpu_usage DECIMAL(5,2) DEFAULT 0,
-          mem_usage DECIMAL(5,2) DEFAULT 0,
-          disk_read_mb DECIMAL(12,2) DEFAULT 0,
-          disk_write_mb DECIMAL(12,2) DEFAULT 0,
-          disk_read_mb_per_min DECIMAL(12,2) DEFAULT 0,
-          disk_write_mb_per_min DECIMAL(12,2) DEFAULT 0,
-          nginx_request_count_per_min INT DEFAULT 0,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          INDEX idx_server (server),
-          INDEX idx_timestamp (timestamp),
-          INDEX idx_server_timestamp (server, timestamp),
-          INDEX idx_created_at (created_at)
-        ) ENGINE=InnoDB
-      `);
+    await addColumnIfMissing(
+      `ALTER TABLE measurements ADD COLUMN check_type VARCHAR(16) NULL AFTER measurement_type`,
+      'measurements.check_type'
+    );
+
+    await addColumnIfMissing(
+      `ALTER TABLE measurements ADD COLUMN viewer_country_code VARCHAR(8) NULL AFTER check_type`,
+      'measurements.viewer_country_code'
+    );
+    await addColumnIfMissing(
+      `ALTER TABLE measurements ADD COLUMN viewer_country_name VARCHAR(128) NULL AFTER viewer_country_code`,
+      'measurements.viewer_country_name'
+    );
+    await addColumnIfMissing(
+      `ALTER TABLE measurements ADD COLUMN viewer_isp VARCHAR(256) NULL AFTER viewer_country_name`,
+      'measurements.viewer_isp'
+    );
+    await addColumnIfMissing(
+      `ALTER TABLE measurements ADD INDEX idx_meas_server_ping_viewer (measurement_type, viewer_country_code, created_at)`,
+      'measurements.idx_meas_server_ping_viewer',
+      [1061]
+    );
+
+    try {
+      await db.execute(
+        `UPDATE measurements SET check_type = 'http' WHERE measurement_type = 'server_ping' AND check_type IS NULL`
+      );
+    } catch (e) {
+      console.warn('ℹ️  measurements check_type backfill skipped:', e.message);
+    }
+
+    try {
+      await db.execute('ALTER TABLE measurements DROP COLUMN proxy_protocol');
+    } catch (dropErr) {
+      if (dropErr.errno !== 1091) {
+        throw dropErr;
+      }
+    }
+
+    try {
+      await db.execute('DROP TABLE IF EXISTS server_metrics');
+      console.log('✅ Removed legacy server_metrics table (Server metrics UI removed)');
+    } catch (e) {
+      console.warn('⚠️ Drop server_metrics skipped:', e.message);
+    }
 
     await db.execute(`
         CREATE TABLE IF NOT EXISTS proxy_ports (
@@ -241,12 +398,84 @@ const initializeDatabase = async (db) => {
           group_name VARCHAR(128) NOT NULL,
           location VARCHAR(255) NOT NULL,
           ip_address VARCHAR(45) NOT NULL,
+          target_port INT NOT NULL DEFAULT 80,
+          ssh_port INT NOT NULL DEFAULT 22,
           sort_order INT NOT NULL DEFAULT 0,
+          user_id BIGINT UNSIGNED NULL,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          UNIQUE KEY uniq_server_ping_group_ip (group_name, ip_address),
           INDEX idx_server_ping_group (group_name)
         ) ENGINE=InnoDB
       `);
+
+    await addColumnIfMissing(
+      'ALTER TABLE server_ping_targets ADD COLUMN target_port INT NOT NULL DEFAULT 80 AFTER ip_address',
+      'server_ping_targets.target_port'
+    );
+
+    await addColumnIfMissing(
+      'ALTER TABLE server_ping_targets ADD COLUMN ssh_port INT NOT NULL DEFAULT 22 AFTER target_port',
+      'server_ping_targets.ssh_port'
+    );
+
+    await addColumnIfMissing(
+      `ALTER TABLE server_ping_targets ADD COLUMN http_probe_path VARCHAR(512) NOT NULL DEFAULT '' AFTER ssh_port`,
+      'server_ping_targets.http_probe_path'
+    );
+
+    try {
+      await db.execute('ALTER TABLE server_ping_targets DROP INDEX uniq_server_ping_group_ip');
+    } catch (e) {
+      if (e.errno !== 1091) {
+        throw e;
+      }
+    }
+    try {
+      await db.execute('ALTER TABLE server_ping_targets DROP INDEX uniq_server_ping_group_ip_port');
+    } catch (e) {
+      if (e.errno !== 1091) {
+        throw e;
+      }
+    }
+
+    await db.execute(`
+        CREATE TABLE IF NOT EXISTS users (
+          id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+          email VARCHAR(255) NOT NULL,
+          password_hash VARCHAR(255) NOT NULL,
+          role ENUM('admin','user') NOT NULL DEFAULT 'user',
+          email_verified_at DATETIME NULL,
+          verification_token_hash CHAR(64) NULL,
+          verification_token_expires_at DATETIME NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          UNIQUE KEY uq_users_email (email),
+          KEY idx_users_role (role)
+        ) ENGINE=InnoDB
+      `);
+
+    await addColumnIfMissing(
+      'ALTER TABLE users ADD COLUMN password_reset_token_hash CHAR(64) NULL AFTER verification_token_expires_at',
+      'users.password_reset_token_hash'
+    );
+    await addColumnIfMissing(
+      'ALTER TABLE users ADD COLUMN password_reset_expires_at DATETIME NULL AFTER password_reset_token_hash',
+      'users.password_reset_expires_at'
+    );
+
+    await db.execute(`
+        CREATE TABLE IF NOT EXISTS server_ping_check_events (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          user_id BIGINT UNSIGNED NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          KEY idx_check_user_time (user_id, created_at),
+          CONSTRAINT fk_server_ping_check_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB
+      `);
+
+    await addColumnIfMissing(
+      'ALTER TABLE server_ping_targets ADD COLUMN user_id BIGINT UNSIGNED NULL AFTER sort_order',
+      'server_ping_targets.user_id'
+    );
 
     await db.execute(`
         CREATE TABLE IF NOT EXISTS proxy_groups (
@@ -362,6 +591,126 @@ const initializeDatabase = async (db) => {
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         ) ENGINE=InnoDB
       `);
+
+    await db.execute(`
+        CREATE TABLE IF NOT EXISTS business_servers (
+          id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+          display_name VARCHAR(255) NOT NULL,
+          ingest_token CHAR(64) NOT NULL,
+          ssh_host VARCHAR(255) NULL,
+          ssh_port INT UNSIGNED NOT NULL DEFAULT 22,
+          ssh_user VARCHAR(128) NULL,
+          deploy_status VARCHAR(32) NULL DEFAULT 'pending',
+          deploy_message VARCHAR(512) NULL,
+          bandwidth_capacity_mbps DECIMAL(12,4) NULL,
+          last_ip VARCHAR(64) NULL,
+          last_seen_at DATETIME(3) NULL,
+          created_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3),
+          updated_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+          UNIQUE KEY uq_business_ingest (ingest_token),
+          KEY idx_business_seen (last_seen_at)
+        ) ENGINE=InnoDB
+      `);
+
+    await addColumnIfMissing(
+      'ALTER TABLE business_servers ADD COLUMN bandwidth_capacity_mbps DECIMAL(12,4) NULL AFTER deploy_message',
+      'business_servers.bandwidth_capacity_mbps'
+    );
+
+    await addColumnIfMissing(
+      `ALTER TABLE business_servers ADD COLUMN group_name VARCHAR(128) NOT NULL DEFAULT 'General' AFTER display_name`,
+      'business_servers.group_name'
+    );
+    await addColumnIfMissing(
+      'ALTER TABLE business_servers ADD COLUMN cpu_cores SMALLINT UNSIGNED NULL AFTER bandwidth_capacity_mbps',
+      'business_servers.cpu_cores'
+    );
+    await addColumnIfMissing(
+      'ALTER TABLE business_servers ADD COLUMN ram_total_mb INT UNSIGNED NULL AFTER cpu_cores',
+      'business_servers.ram_total_mb'
+    );
+
+    await db.execute(`
+        CREATE TABLE IF NOT EXISTS business_server_metrics (
+          id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+          business_server_id BIGINT UNSIGNED NOT NULL,
+          recorded_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+          cpu_percent DECIMAL(8,2) NULL,
+          ram_percent DECIMAL(8,2) NULL,
+          disk_percent DECIMAL(8,2) NULL,
+          dl_mbps DECIMAL(12,4) NULL,
+          ul_mbps DECIMAL(12,4) NULL,
+          rps DECIMAL(12,4) NULL,
+          db_qps DECIMAL(12,4) NULL,
+          KEY idx_bsm_server_time (business_server_id, recorded_at),
+          KEY idx_bsm_recorded (recorded_at),
+          CONSTRAINT fk_bsm_server FOREIGN KEY (business_server_id) REFERENCES business_servers(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB
+      `);
+
+    try {
+      const [[{ mc }]] = await db.execute(`SELECT COUNT(*) AS mc FROM business_server_metrics`);
+      const [[{ cc }]] = await db.execute(
+        `SELECT COUNT(*) AS cc FROM information_schema.columns
+         WHERE table_schema = DATABASE() AND table_name = 'business_servers' AND column_name = 'last_cpu'`
+      );
+      if (Number(mc) === 0 && Number(cc) > 0) {
+        await db.execute(`
+          INSERT INTO business_server_metrics (
+            business_server_id, recorded_at, cpu_percent, ram_percent, disk_percent,
+            dl_mbps, ul_mbps, rps, db_qps
+          )
+          SELECT
+            id,
+            COALESCE(last_seen_at, UTC_TIMESTAMP(3)),
+            last_cpu, last_ram, last_disk, last_dl_mbps, last_ul_mbps, last_rps, last_db_qps
+          FROM business_servers
+          WHERE last_seen_at IS NOT NULL
+        `);
+        console.log('✅ Backfilled business_server_metrics from business_servers snapshot');
+      }
+    } catch (e) {
+      console.warn('⚠️ business_server_metrics backfill skipped:', e.message);
+    }
+
+    for (const col of [
+      'last_cpu',
+      'last_ram',
+      'last_disk',
+      'last_dl_mbps',
+      'last_ul_mbps',
+      'last_rps',
+      'last_db_qps'
+    ]) {
+      await dropColumnIfExists('business_servers', col, `business_servers.${col}`);
+    }
+
+    await db.execute(`
+        CREATE TABLE IF NOT EXISTS server_mtr_runs (
+          id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+          server_ping_target_id INT NOT NULL,
+          proxy_host VARCHAR(255) NOT NULL,
+          proxy_port INT NOT NULL,
+          path_mode VARCHAR(24) NOT NULL DEFAULT 'direct',
+          target_port INT NOT NULL,
+          status VARCHAR(32) NOT NULL,
+          report_text MEDIUMTEXT NULL,
+          summary_json JSON NULL,
+          error_message TEXT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          KEY idx_mtr_target_proxy_time (server_ping_target_id, proxy_port, created_at),
+          CONSTRAINT fk_server_mtr_target
+            FOREIGN KEY (server_ping_target_id) REFERENCES server_ping_targets(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB
+      `);
+
+    await migrateServerMtrRunsDropCheckType(db);
+
+    const { bootstrapServerPingAuth } = require('./serverPingAuthBootstrap');
+    await bootstrapServerPingAuth(db);
+
+    await migrateServerPingTargetsHttpOnly(db);
+    await migrateServerPingTargetsCreatorKey(db);
 
     await db.execute("SET time_zone = '+00:00';");
     console.log('✅ Database tables initialized successfully');

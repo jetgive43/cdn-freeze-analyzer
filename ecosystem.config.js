@@ -3,7 +3,7 @@ module.exports = {
     {
       name: 'cdn-freeze-detect-backend',
       script: './backend/index.js',
-      cwd: '/home/cdn-freeze-detect',
+      cwd: '/root/cdn-freeze-analyzer',
       instances: 1,
       exec_mode: 'fork',
       env: {
@@ -22,10 +22,11 @@ module.exports = {
     {
       name: 'cdn-freeze-detect-frontend',
       script: 'npx',
-      args: 'serve -s build -l 3000',
-      cwd: '/home/cdn-freeze-detect/frontend',
+      args: 'serve -s build -l tcp://0.0.0.0:3000',
+      cwd: '/root/cdn-freeze-analyzer/frontend',
       instances: 1,
       exec_mode: 'fork',
+      // Plain HTTP on 3000 (no TLS in `serve`). Use HTTP for the UI so browser pings can hit http:// targets.
       env: {
         NODE_ENV: 'production'
       },

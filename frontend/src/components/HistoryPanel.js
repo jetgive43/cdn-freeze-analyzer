@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import axios from 'axios';
+import { useAuth } from '../context/AuthContext';
 
 const HistoryPanel = () => {
+    const { authHeader } = useAuth();
     const [chartData, setChartData] = useState(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
@@ -38,7 +40,7 @@ const HistoryPanel = () => {
 
     const fetchPorts = useCallback(async () => {
         try {
-            const response = await fetch('/api/ports');
+            const response = await fetch('/api/ports', { headers: { ...authHeader() } });
             if (!response.ok) {
                 throw new Error(`Failed to load ports (${response.status})`);
             }
@@ -58,7 +60,7 @@ const HistoryPanel = () => {
             setPorts([]);
             setProxyPort('');
         }
-    }, []);
+    }, [authHeader]);
 
     // Fetch companies for dropdown
     const fetchCompanies = useCallback(async () => {
@@ -72,7 +74,8 @@ const HistoryPanel = () => {
                 `/api/companies/historical`,
                 {
                     params: { proxyPort, period },
-                    timeout: 30000
+                    timeout: 30000,
+                    headers: { ...authHeader() },
                 }
             );
             if (response.data.success) {
@@ -82,7 +85,7 @@ const HistoryPanel = () => {
         } catch (err) {
             console.error('❌ Error fetching companies:', err);
         }
-    }, [proxyPort, period]);
+    }, [proxyPort, period, authHeader]);
 
     // Fetch chart data WITHOUT pagination
     const fetchChartData = useCallback(async () => {
@@ -101,7 +104,8 @@ const HistoryPanel = () => {
                     period,
                     company: selectedCompany
                 },
-                timeout: 50000
+                timeout: 50000,
+                headers: { ...authHeader() },
             });
 
             if (response.data.success) {
@@ -124,7 +128,7 @@ const HistoryPanel = () => {
         } finally {
             setLoading(false);
         }
-    }, [proxyPort, period, selectedCompany]);
+    }, [proxyPort, period, selectedCompany, authHeader]);
 
 
     const sortDisplaySeries = useCallback((field, order) => {
